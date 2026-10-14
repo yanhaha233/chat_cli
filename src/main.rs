@@ -25,13 +25,6 @@ struct ChatRequest {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct ChatResponse {
-    id: String,
-    usage: Usage,
-    choices: Vec<Choice>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -39,11 +32,20 @@ struct Usage {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Choice {
-    index: u32,
-    message: Message,
+struct Delta {
+    content: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct StreamChoice {
+    delta: Delta,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct StreamChunk {
+    choices: Vec<StreamChoice>,
     #[serde(default)]
-    finish_reason: Option<String>,
+    usage: Option<Usage>,
 }
 
 #[tokio::main]
@@ -55,7 +57,7 @@ async fn main() -> Result<()> {
     println!("你好，有什么可以帮助你的?");
 
     loop {
-        print!("你: ");
+        print!("\n你: ");
         stdout().flush()?;
         let mut s = String::new();
         stdin().read_line(&mut s).context("读取标准输入失败")?;
@@ -83,68 +85,20 @@ async fn main() -> Result<()> {
             content: input,
         };
 
+        message_history.push(the_first);
         // 流输出
-        request_to_response_as_stream(&message_history).await?;
+        let (reply_message, reply_usage) = request_to_response_as_stream(&message_history).await?;
 
-        //message_history.push(the_first);
+        println!(
+            "\n本次prompt_tokens: {},本次completion_tokens: {}, 本次total_tokens: {}",
+            reply_usage.prompt_tokens, reply_usage.completion_tokens, reply_usage.total_tokens
+        );
 
-        // let (reply_message, reply_usage) = request_to_response(&message_history).await?;
-        // println!(
-        //     "{} \n本次prompt_tokens: {},本次completion_tokens: {}, 本次total_tokens: {}",
-        //     reply_message.content,
-        //     reply_usage.prompt_tokens,
-        //     reply_usage.completion_tokens,
-        //     reply_usage.total_tokens
-        // );
-
-        //message_history.push(reply_message);
+        message_history.push(reply_message);
     }
 }
 
-async fn request_to_response(messages: &[Message]) -> Result<(Message, Usage)> {
-    let url = "https://api.deepseek.com/chat/completions";
-    let token = std::env::var("DEEPSEEK_API_KEY").context("获取API KEY 失败")?;
-
-    let chat_request = ChatRequest {
-        model: "deepseek-flash".to_string(),
-        messages: messages.to_vec(),
-        thinking: Thinking {
-            kind: "disabled".to_string(),
-        },
-        stream: true,
-    };
-
-    let response = reqwest::Client::new()
-        .post(url)
-        .bearer_auth(token)
-        .json(&chat_request)
-        .send()
-        .await
-        .context("发送HTTP请求失败")?;
-
-    // 状态码
-    let status = response.status();
-    let body = response.text().await.context("读取响应 body 失败")?;
-
-    if !status.is_success() {
-        anyhow::bail!("API 返回错误状态 {},响应体: {}", status, body);
-    }
-
-    let chat_response: ChatResponse = serde_json::from_str(&body)
-        .with_context(|| format!("解析 JSON 失败，原始响应：{}", body))?;
-
-    let ChatResponse { usage, choices, .. } = chat_response;
-
-    let reply_messages = choices
-        .into_iter()
-        .next()
-        .context("响应中没有 choices")?
-        .message;
-
-    Ok((reply_messages, usage))
-}
-
-async fn request_to_response_as_stream(messages: &[Message]) -> Result<()> {
+async fn request_to_response_as_stream(messages: &[Message]) -> Result<(Message, Usage)> {
     let url = "https://api.deepseek.com/chat/completions";
     let token = std::env::var("DEEPSEEK_API_KEY").context("获取API KEY 失败")?;
 
@@ -169,7 +123,16 @@ async fn request_to_response_as_stream(messages: &[Message]) -> Result<()> {
 
     let mut buf: Vec<u8> = Vec::new();
 
-    while let Some(item) = body.next().await {
+    let mut content = String::new();
+
+    let mut usage = Usage {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+    };
+
+    println!();
+    'outer: while let Some(item) = body.next().await {
         buf.extend(item?.iter());
         //buf.extend_from_slice(&item?);
 
@@ -181,15 +144,30 @@ async fn request_to_response_as_stream(messages: &[Message]) -> Result<()> {
                 continue;
             } else if let Some(l) = line.strip_prefix("data: ") {
                 if l == "[DONE]" {
-                    break;
+                    break 'outer;
                 } else {
-                    println!("{l}");
+                    let parsed: StreamChunk = serde_json::from_str(l)?;
+                    if let Some(par) = parsed.choices.first() {
+                        if let Some(ref s) = par.delta.content {
+                            let mut out = stdout();
+                            print!("{}", s);
+                            content.push_str(s);
+                            out.flush()?;
+                        }
+                    }
+
+                    if let Some(us) = parsed.usage {
+                        usage = us
+                    }
                 }
-            } else {
-                // serde 解析
             }
         }
     }
+    println!();
 
-    Ok(())
+    let message_reply = Message {
+        role: "assistant".to_string(),
+        content: content,
+    };
+    Ok((message_reply, usage))
 }
