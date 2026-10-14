@@ -1,6 +1,7 @@
 use std::io::{Write, stdin, stdout};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Ok, Result};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -82,18 +83,21 @@ async fn main() -> Result<()> {
             content: input,
         };
 
-        message_history.push(the_first);
+        // 流输出
+        request_to_response_as_stream(&message_history).await?;
 
-        let (reply_message, reply_usage) = request_to_response(&message_history).await?;
-        println!(
-            "{} \n本次prompt_tokens: {},本次completion_tokens: {}, 本次total_tokens: {}",
-            reply_message.content,
-            reply_usage.prompt_tokens,
-            reply_usage.completion_tokens,
-            reply_usage.total_tokens
-        );
+        //message_history.push(the_first);
 
-        message_history.push(reply_message);
+        // let (reply_message, reply_usage) = request_to_response(&message_history).await?;
+        // println!(
+        //     "{} \n本次prompt_tokens: {},本次completion_tokens: {}, 本次total_tokens: {}",
+        //     reply_message.content,
+        //     reply_usage.prompt_tokens,
+        //     reply_usage.completion_tokens,
+        //     reply_usage.total_tokens
+        // );
+
+        //message_history.push(reply_message);
     }
 }
 
@@ -107,7 +111,7 @@ async fn request_to_response(messages: &[Message]) -> Result<(Message, Usage)> {
         thinking: Thinking {
             kind: "disabled".to_string(),
         },
-        stream: false,
+        stream: true,
     };
 
     let response = reqwest::Client::new()
@@ -138,4 +142,54 @@ async fn request_to_response(messages: &[Message]) -> Result<(Message, Usage)> {
         .message;
 
     Ok((reply_messages, usage))
+}
+
+async fn request_to_response_as_stream(messages: &[Message]) -> Result<()> {
+    let url = "https://api.deepseek.com/chat/completions";
+    let token = std::env::var("DEEPSEEK_API_KEY").context("获取API KEY 失败")?;
+
+    let chat_request = ChatRequest {
+        model: "deepseek-flash".to_string(),
+        messages: messages.to_vec(),
+        thinking: Thinking {
+            kind: "disabled".to_string(),
+        },
+        stream: true,
+    };
+
+    let response = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(token)
+        .json(&chat_request)
+        .send()
+        .await
+        .context("发送HTTP请求失败")?;
+
+    let mut body = response.bytes_stream();
+
+    let mut buf: Vec<u8> = Vec::new();
+
+    while let Some(item) = body.next().await {
+        buf.extend(item?.iter());
+        //buf.extend_from_slice(&item?);
+
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line = std::str::from_utf8(&buf[..pos])?.to_string();
+            buf.drain(..=pos);
+
+            if line.trim().is_empty() {
+                continue;
+            } else if let Some(l) = line.strip_prefix("data: ") {
+                if l == "[DONE]" {
+                    break;
+                } else {
+                    println!("{l}");
+                }
+            } else {
+                // serde 解析
+            }
+        }
+    }
+
+    Ok(())
 }
